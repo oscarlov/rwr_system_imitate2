@@ -126,6 +126,12 @@ class RetargeterCalibrationCollector(Node):
             exc = fut.exception()
             if exc is not None:
                 self.get_logger().error(f"Failed to call set_torque_enabled: {exc}")
+                return
+            res = fut.result()
+            if res.success:
+                self.get_logger().info(f"Hand controller: {res.message}")
+            else:
+                self.get_logger().error(f"Hand controller: {res.message}")
 
         future.add_done_callback(_done_cb)
 

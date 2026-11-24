@@ -46,11 +46,19 @@ class OrcaHandV2:
         vel = self._joint_signs * np.asarray(state.velocity)[self._joint_order] / motor_ratios
         return pos, vel
 
+    def hold_current_pose(self):
+        """Write the measured motor positions as goals. On Feetech motors this
+        also turns torque on, holding the hand where it is."""
+        state = self._hand.get_motor_state()  # ordered by config.motor_ids
+        self._hand.write_motor_pos(list(self._hand.config.motor_ids), state.position)
+
     def enable_torque(self):
-        self._hand.enable_torque()
+        """Returns the motor IDs that did not acknowledge (empty list on success)."""
+        return self._hand.enable_torque()
 
     def disable_torque(self):
-        self._hand.disable_torque()
+        """Returns the motor IDs that did not acknowledge (empty list on success)."""
+        return self._hand.disable_torque()
 
     def disconnect(self):
         self._hand.disconnect()

@@ -57,6 +57,10 @@ class HandControllerNode(Node):
         else:
             raise NotImplementedError("Hand name not recognized")
 
+        # Position commands are dropped while torque is off: on the Feetech
+        # motors any goal-position write turns torque back on.
+        self._torque_enabled = not self.compliant_test_mode
+
         self.joint_angle_sub = self.create_subscription(
             Float32MultiArray, f"/{self.chirality}/hand/policy_output", self.joint_angle_cb, 0
         )
@@ -77,6 +81,11 @@ class HandControllerNode(Node):
         num_motors = self._hc.num_motors
         if len(msg.data) != num_motors:
             self.get_logger().error(f"Expected {num_motors} joint angles, got {len(msg.data)}")
+            return
+        if not self._torque_enabled:
+            self.get_logger().warn(
+                "Torque is disabled; ignoring position commands", throttle_duration_sec=2.0
+            )
             return
         joint_angles = np.array(msg.data)
         joint_angles = np.rad2deg(joint_angles)
@@ -100,16 +109,25 @@ class HandControllerNode(Node):
         Enable or disable torque on the underlying hand controller via a SetBool service.
         """
         try:
+            action = "enabled" if request.data else "disabled"
             if request.data:
-                self._hc.enable_torque()
-                self.get_logger().info("Torque enabled via service")
-                response.success = True
-                response.message = "Torque enabled"
+                if self.hand_name == "orca_v2":
+                    # Make the current pose the goal so the hand stays where it
+                    # was moved to instead of snapping back to the last command.
+                    self._hc.hold_current_pose()
+                failed_ids = self._hc.enable_torque() or []
+                self._torque_enabled = True
             else:
-                self._hc.disable_torque()
-                self.get_logger().info("Torque disabled via service")
+                self._torque_enabled = False
+                failed_ids = self._hc.disable_torque() or []
+            if failed_ids:
+                response.success = False
+                response.message = f"Torque not {action} on motor IDs {list(failed_ids)} (no ack)"
+                self.get_logger().error(response.message)
+            else:
                 response.success = True
-                response.message = "Torque disabled"
+                response.message = f"Torque {action}"
+                self.get_logger().info(f"Torque {action} via service")
         except Exception as e:
             self.get_logger().error(f"Failed to set torque: {e}")
             response.success = False

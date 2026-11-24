@@ -154,6 +154,23 @@ class OakDDriver:
 
 
     def _run(self):
+        # The device can crash or drop off USB mid-run (power/cable); wait for it to come back and reconnect
+        # instead of letting the thread die and leaving the stream dead for the rest of the run.
+        while not self._stop.is_set():
+            try:
+                self._run_once()
+            except RuntimeError as e:
+                print(f"[{self.camera_name}] ERROR: device lost ({e}); reconnecting...", flush=True)
+            if self._stop.is_set():
+                break
+            # a crashed OAK reboots and re-enumerates after a few seconds
+            while not self._stop.is_set():
+                ids = [d.getMxId() for d in dai.Device.getAllAvailableDevices()]
+                if (self.device_mxid is None and ids) or self.device_mxid in ids:
+                    break
+                time.sleep(0.5)
+
+    def _run_once(self):
         pipeline = create_pipeline(use_depth=self.use_depth, use_color=COLOR)
 
         # Open device
