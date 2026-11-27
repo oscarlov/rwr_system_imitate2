@@ -12,8 +12,49 @@ Keys containing "arm" are treated as a 7-dim arm pose (PoseStamped:
 position + quaternion); keys containing "hand" as a Float32MultiArray of
 joint angles. Single- vs dual-arm is just how many entries the dicts have,
 so the same node handles both unimanual and bimanual policies.
+
+[PATCH] Optional runtime settings, read from the `runtime_patches` section of
+the inference config yaml (all keys optional, defaults shown):
+
+  runtime_patches:
+    renormalize_quat: true        # q / |q| after aggregation, if |q| is within quat_renorm_tol of 1
+    quat_renorm_tol: 0.05         # farther than this from 1 -> still discarded (real bug, not rounding)
+    log_timing: true              # step_i/timing/* in the hdf5 log + periodic latency summary
+    arm_stall_warning: true       # warn if the arm does not follow the commands (reflex, controller off)
+    hand_latch:
+      enabled: false              # keep the hand closed through short "reopen" blips of the policy
+      joints: [6, 9, 12, 15]      # joints whose mean decides closed/open (ORCA v2: index/middle/ring/pinky MCP)
+      close_deg: 50.0             # mean above this -> hand counts as closed, latch engages
+      open_deg: 30.0              # mean below this for release_steps steps -> latch released
+      release_steps: 5            # 5 steps = 0.5 s at 10 Hz
+    arm_lookahead_steps: 0        # >0: execute each predicted ARM chunk starting this many steps in.
+                                  # The arm lags its commands by ~5 steps; the operators' commands in the
+                                  # demos ran ahead of it, while the policy's chunk starts at the arm.
+                                  # Also switches to plain chunk execution (no averaging) and
+                                  # re-predicts every T_target - arm_lookahead_steps steps. Hand is not shifted.
+    wrist_offset_deg: 0.0         # hand wrist (joint 0) calibration now minus at recording time, in degrees.
+                                  # The policy sees wrist - offset and its wrist command is sent as cmd + offset,
+                                  # so it works in the recording-time calibration. Logs keep hardware values.
+    arm_lead_gain: 1.0            # >1: amplify each arm command's lead beyond the measured position (faster arm)
+    arm_lead_max_m: 0.15          # cap on that lead
+    arm_init_max_step_m: 0.002    # init_arm: max command lead ahead of the measured position per step
+    arm_init_max_step_deg: 0.86   # init_arm: max command lead in rotation per step
+    arm_init_tolerance_m: 0.015   # init_arm done: within this and arm_init_tolerance_deg, with the arm stopped
+    arm_init_tolerance_deg: 5.0
+    arm_init_integral_gain: 0.05  # init_arm: pushes the command past the target until the arm arrives
+    arm_init_stalled_ok_deg: 20.0 # init_arm also done if the arm stops (arm_init_stalled_wait_s) within 2x the position
+                                  # tolerance and this rotation (yaw about the tool axis barely follows)
+    auto_return:
+      enabled: false              # after each grasp attempt (missed, dropped, or no grasp within
+                                  # no_grasp_timeout_s) drive back to arm_init_pose with the hand open,
+                                  # clear the rest of the action chunk and continue. Needs allow_arm_init.
+      no_grasp_timeout_s: 15.0
+      lift_m: 0.05
+      closed_deg: 50.0
+      after_release_s: 1.0
 """
 import time
+from collections import deque
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -39,6 +80,63 @@ from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy, HistoryPo
 
 import h5py
 import os
+
+
+class HandLatch:
+    """[PATCH] Hysteresis on hand closure.
+
+    While the policy commands a closed hand, its command passes through and is
+    remembered. If the command then drops below the closed threshold, the last
+    closed command is held, until the policy has asked for an open hand
+    (mean below open_deg) for release_steps steps since it last asked for a
+    closed one. In-between commands (open_deg..close_deg) neither count nor
+    reset that tally, so a policy hovering around 30-50 deg cannot keep the
+    hand trapped. max_hold_steps (if set) releases the hold after that many
+    steps in total, however the policy behaves.
+    Short reopen blips (e.g. at a chunk change) are filtered; a real release
+    (placing the cube) is delayed by release_steps / control_freq seconds.
+    """
+
+    def __init__(self, joints=(6, 9, 12, 15), close_deg=50.0, open_deg=30.0, release_steps=5,
+                 max_hold_steps=None):
+        self.joints = list(joints)
+        self.close_rad = np.deg2rad(close_deg)
+        self.open_rad = np.deg2rad(open_deg)
+        self.release_steps = int(release_steps)
+        self.max_hold_steps = None if max_hold_steps is None else int(max_hold_steps)
+        self.reset()
+
+    def reset(self):
+        self.hold = None
+        self.open_count = 0
+        self.held_steps = 0
+
+    @property
+    def latched(self):
+        return self.hold is not None
+
+    def __call__(self, hand):
+        closure = float(np.mean(hand[self.joints]))
+        if self.hold is not None:
+            self.held_steps += 1
+            if self.max_hold_steps is not None and self.held_steps > self.max_hold_steps:
+                self.reset()
+                return hand
+        if closure >= self.close_rad:
+            if self.hold is None:
+                self.held_steps = 0
+            self.hold = hand.copy()
+            self.open_count = 0
+            return hand
+        if self.hold is None:
+            return hand
+        if closure < self.open_rad:
+            self.open_count += 1
+        if self.open_count >= self.release_steps:
+            self.reset()
+            return hand
+        return self.hold.copy()
+
 
 class CameraListener(Node):
     def __init__(self, camera_topic, name, node):
@@ -114,6 +212,67 @@ class PolicyPlayerAgent(Node):
         self.actions_cfg = inference_config["actions"]
         self.arm_command_frame = inference_config.get("arm_command_frame")
 
+        # [PATCH] optional runtime settings (see module docstring)
+        patches = inference_config.get("runtime_patches", {}) or {}
+        self.renormalize_quat = bool(patches.get("renormalize_quat", True))
+        self.quat_renorm_tol = float(patches.get("quat_renorm_tol", 0.05))
+        self.log_timing = bool(patches.get("log_timing", True))
+        self.arm_stall_warning = bool(patches.get("arm_stall_warning", True))
+        # Max observation age when the action is published (after the forward pass).
+        # Inputs must still be max_observation_age fresh before inference; this only
+        # gives slower models (e.g. 2-frame history) room for the forward pass.
+        self.max_action_latency = float(patches.get("max_action_latency_s", self.max_observation_age))
+        latch_cfg = patches.get("hand_latch", {}) or {}
+        self.hand_latch = None
+        if latch_cfg.get("enabled", False):
+            self.hand_latch = HandLatch(
+                joints=latch_cfg.get("joints", [6, 9, 12, 15]),
+                close_deg=latch_cfg.get("close_deg", 50.0),
+                open_deg=latch_cfg.get("open_deg", 30.0),
+                release_steps=latch_cfg.get("release_steps", 5),
+                max_hold_steps=latch_cfg.get("max_hold_steps"),
+            )
+        self.wrist_offset_rad = np.deg2rad(float(patches.get("wrist_offset_deg", 0.0)))
+        # [PATCH] init_arm step limits: how far ahead of the measured pose each init command may be.
+        # The default 2 mm / 0.86 deg is too little lead for the Franka controller to move at all.
+        self.arm_init_max_step = float(patches.get("arm_init_max_step_m", 0.002))
+        self.arm_init_max_rot = np.deg2rad(float(patches.get("arm_init_max_step_deg", np.rad2deg(0.015))))
+        self.arm_init_tol = float(patches.get("arm_init_tolerance_m", 0.015))
+        self.arm_init_tol_rot = np.deg2rad(float(patches.get("arm_init_tolerance_deg", 5.0)))
+        self.arm_init_stall_rot = np.deg2rad(float(patches.get("arm_init_stalled_ok_deg", 20.0)))
+        # Give the integral term time to overcome the twist dead zone before accepting a stalled pose.
+        self.arm_init_stall_wait = float(patches.get("arm_init_stalled_wait_s", 4.0))
+        self.arm_init_ki = float(patches.get("arm_init_integral_gain", 0.05))
+        # [PATCH] auto return: after each grasp attempt, go back to arm_init_pose and continue
+        ar_cfg = patches.get("auto_return", {}) or {}
+        self.auto_return = bool(ar_cfg.get("enabled", False))
+        self.return_timeout_s = float(ar_cfg.get("no_grasp_timeout_s", 15.0))
+        self.return_lift_m = float(ar_cfg.get("lift_m", 0.05))
+        self.return_closed_rad = np.deg2rad(float(ar_cfg.get("closed_deg", 50.0)))
+        self.return_after_release_s = float(ar_cfg.get("after_release_s", 1.0))
+        self.return_joints = list(latch_cfg.get("joints", [6, 9, 12, 15]))
+        if self.auto_return and (not self.allow_arm_init or self.arm_init_target is None):
+            self.get_logger().error("auto_return needs allow_arm_init:=true and an arm_init_pose; disabled.")
+            self.auto_return = False
+        self.returning = False
+        self.attempt = None
+        self.attempt_idx = 0
+        self.return_hand_cmd = None
+        self.arm_lead_gain = float(patches.get("arm_lead_gain", 1.0))
+        self.arm_lead_max = float(patches.get("arm_lead_max_m", 0.15))
+        self.n_discards = 0                # discards since the last logged step
+        self.last_discard_reason = ""
+        self.n_quat_renorm = 0              # renormalizations since the last logged step
+        self.max_quat_dev = 0.0             # largest |q|-1 seen since the last logged step
+        self.timing_hist = deque(maxlen=50)
+        self.stall_start = None             # (t, measured position) when the arm started lagging
+        self.get_logger().info(
+            f"[PATCH] renormalize_quat={self.renormalize_quat} log_timing={self.log_timing} "
+            f"arm_stall_warning={self.arm_stall_warning} hand_latch={'on' if self.hand_latch else 'off'} "
+            f"wrist_offset_deg={np.rad2deg(self.wrist_offset_rad):.1f} arm_lead_gain={self.arm_lead_gain} "
+            f"auto_return={'on' if self.auto_return else 'off'}"
+        )
+
         self.lock = Lock()
         self.observation_callbacks = MutuallyExclusiveCallbackGroup()
 
@@ -156,6 +315,7 @@ class PolicyPlayerAgent(Node):
         # --- Load policy ---
         print(f"About to load policy")
         self.policy = get_policy_from_ckpt(self.policy_ckpt_path)
+        self.apply_arm_lookahead(int(patches.get("arm_lookahead_steps", 0)))
         self.policy.reset_policy()
 
         # --- State variables ---
@@ -188,6 +348,7 @@ class PolicyPlayerAgent(Node):
                 self.start_logging()
                 self.policy.reset_policy()
                 self.policy_stamp = None
+                self.reset_patch_state()  # [PATCH]
                 self.running_policy = True
                 self.get_logger().info("Policy started.")
         elif command == "stop":
@@ -204,6 +365,7 @@ class PolicyPlayerAgent(Node):
             self.policy.reset_policy()
             self.policy_stamp = None
             self.arm_init_failed = False
+            self.reset_patch_state()  # [PATCH]
             self.get_logger().info("Policy state reset.")
         elif command == "init_arm":
             self.start_arm_init()
@@ -212,6 +374,21 @@ class PolicyPlayerAgent(Node):
             rclpy.try_shutdown()
         else:
             self.get_logger().warn(f"Unknown command: {command}")
+
+    def reset_patch_state(self):
+        """[PATCH] Clear the latch, counters and stall detector."""
+        if self.hand_latch is not None:
+            self.hand_latch.reset()
+        self.n_discards = 0
+        self.last_discard_reason = ""
+        self.n_quat_renorm = 0
+        self.max_quat_dev = 0.0
+        self.timing_hist.clear()
+        self.stall_start = None
+        self.returning = False
+        self.attempt = {"phase": "approach", "t0": time.monotonic(), "z0": None, "lifted": False, "released_at": None}
+        self.attempt_idx = 0
+        self.return_hand_cmd = None
 
     def start_logging(self):
         """Start a new log file for the policy."""
@@ -297,15 +474,82 @@ class PolicyPlayerAgent(Node):
         ):
             self.abort_arm_init("set a verified arm_init_pose and frame and check the right-arm controller connection")
             return
+        self.begin_arm_move()
+        self.get_logger().info("Arm initialization started.")
+
+    def begin_arm_move(self):
+        """[PATCH] Start driving the arm to arm_init_target (run_arm_init does the steps)."""
         self.arm_init_failed = False
         self.arm_init_settled_at = None
+        self.arm_init_bias_pos = np.zeros(3)     # integral term against the controller's steady-state error
+        self.arm_init_bias_rot = np.zeros(3)
+        self.arm_init_prev = None
         self.arm_init_deadline = time.monotonic() + 90.0
-        self.get_logger().info("Arm initialization started.")
 
     def abort_arm_init(self, reason):
         self.arm_init_deadline = None
         self.arm_init_failed = True
         self.get_logger().error(f"Arm initialization stopped: {reason}.")
+        if self.returning:                       # [PATCH] a failed auto return stops the policy
+            self.returning = False
+            if self.running_policy:
+                self.running_policy = False
+                self.stop_logging()
+            self.get_logger().error("Auto return did not complete; policy stopped.")
+
+    def begin_return(self, reason):
+        """[PATCH] End the current attempt and drive the arm back to arm_init_pose; the policy pauses."""
+        self.get_logger().info(f"Attempt {self.attempt_idx} ended ({reason}); returning to the init pose.")
+        self.returning = True
+        self.begin_arm_move()
+
+    def finish_return(self):
+        """[PATCH] Back at the init pose: drop the rest of the old action chunk and continue the policy."""
+        self.returning = False
+        self.policy.reset_policy()               # only clears the action buffer; the model stays loaded
+        self.policy_stamp = None
+        if self.hand_latch is not None:
+            self.hand_latch.reset()
+        self.attempt_idx += 1
+        self.attempt = {"phase": "approach", "t0": time.monotonic(), "z0": None, "lifted": False, "released_at": None}
+        self.get_logger().info(f"Back at the init pose; attempt {self.attempt_idx} starts.")
+
+    def publish_hand(self, hand_cmd):
+        """[PATCH] Send a hand command (used to keep the hand open while returning)."""
+        for key in self.actions_cfg:
+            if not self._is_arm_key(key):
+                msg = numpy_to_float32_multiarray(hand_cmd)
+                self.action_pubs[key].publish(msg)
+                if key in self.control_pubs:
+                    self.control_pubs[key].publish(msg)
+
+    def track_attempt(self, action_dict, obs_dict):
+        """[PATCH] Decide when a grasp attempt is over (missed, dropped, or no grasp in time)."""
+        hand_key = next((k for k in action_dict if not self._is_arm_key(k)), None)
+        if hand_key is None or obs_dict.get("qpos_arm") is None:
+            return
+        closure = float(np.mean(action_dict[hand_key][self.return_joints]))
+        closed = closure >= self.return_closed_rad
+        z = float(obs_dict["qpos_arm"][2])
+        now = time.monotonic()
+        a = self.attempt
+        if self.return_hand_cmd is None and not closed:
+            self.return_hand_cmd = np.array(action_dict[hand_key], dtype=np.float64).copy()   # open approach posture
+        if a["phase"] == "approach":
+            if closed:
+                a.update(phase="grasp", z0=z, lifted=False)
+            elif now - a["t0"] > self.return_timeout_s:
+                self.begin_return(f"no grasp within {self.return_timeout_s:.0f} s")
+        elif a["phase"] == "grasp":
+            if z - a["z0"] > self.return_lift_m:
+                a["lifted"] = True
+            if not closed:
+                if a["lifted"]:
+                    a.update(phase="released", released_at=now)
+                else:
+                    self.begin_return("missed grasp: hand reopened without lifting")
+        elif a["phase"] == "released" and now - a["released_at"] >= self.return_after_release_s:
+            self.begin_return("cube lifted and released")
 
     def run_arm_init(self):
         now = time.monotonic()
@@ -326,31 +570,64 @@ class PolicyPlayerAgent(Node):
             return
 
         target = self.arm_init_target
-        offset = target[:3] - current[:3]
-        distance = np.linalg.norm(offset)
         rotation = Rotation.from_quat(current[3:])
-        correction = (Rotation.from_quat(target[3:]) * rotation.inv()).as_rotvec()
-        angle = np.linalg.norm(correction)
-        if distance <= 0.005 and angle <= np.deg2rad(3.0):
+        target_rot = Rotation.from_quat(target[3:])
+        error_pos = target[:3] - current[:3]
+        error_rot = (target_rot * rotation.inv()).as_rotvec()
+        distance = np.linalg.norm(error_pos)
+        angle = np.linalg.norm(error_rot)
+
+        # [PATCH] Done when close enough AND the arm has stopped. The compliant controller
+        # settles ~1-2 cm / ~7 deg short of a command, so 5 mm / 3 deg was never reached.
+        still = self.arm_init_prev is not None and (
+            np.linalg.norm(current[:3] - self.arm_init_prev[:3]) < 0.001                       # < 1 mm per step
+            and (Rotation.from_quat(self.arm_init_prev[3:]) * rotation.inv()).magnitude() < np.deg2rad(0.3))
+        self.arm_init_prev = current.copy()
+        # [PATCH] Also done when the arm has stopped making progress but is close (2 s still within
+        # 2x the tolerances): the controller barely follows yaw about the tool axis, so the last
+        # ~10-15 deg of yaw may never come (demo start yaw itself varies by about +-15 deg).
+        within = distance <= self.arm_init_tol and angle <= self.arm_init_tol_rot
+        close = distance <= 2 * self.arm_init_tol and angle <= self.arm_init_stall_rot
+        if still and (within or close):
             if self.arm_init_settled_at is None:
                 self.arm_init_settled_at = now
-            elif now - self.arm_init_settled_at >= 0.3:
+            elif now - self.arm_init_settled_at >= (0.5 if within else self.arm_init_stall_wait):
                 self.arm_init_deadline = None
-                self.get_logger().info("Arm reached init pose. Ready for start.")
-            return
+                if self.returning:
+                    self.finish_return()
+                else:
+                    self.get_logger().info(
+                        f"Arm reached init pose ({100 * distance:.1f} cm, {np.degrees(angle):.1f} deg off). Ready for start.")
+                return
+        else:
+            self.arm_init_settled_at = None
 
-        self.arm_init_settled_at = None
+        # [PATCH] Integral term: near the target, push the command past it by the accumulated
+        # remaining error, so the arm actually arrives despite the controller's compliance.
+        if distance < 0.05 and angle < np.deg2rad(20):
+            self.arm_init_bias_pos = np.clip(self.arm_init_bias_pos + self.arm_init_ki * error_pos, -0.03, 0.03)
+            self.arm_init_bias_rot = self.arm_init_bias_rot + self.arm_init_ki * error_rot
+            n = np.linalg.norm(self.arm_init_bias_rot)
+            if n > np.deg2rad(15):
+                self.arm_init_bias_rot *= np.deg2rad(15) / n
+        desired_pos = target[:3] + self.arm_init_bias_pos
+        desired_rot = Rotation.from_rotvec(self.arm_init_bias_rot) * target_rot
+
         # Limit each requested displacement relative to the measured pose.
         # A stalled arm cannot accumulate commands further along the path.
-        if distance > 0.002:
-            offset *= 0.002 / distance
-        if angle > 0.015:
-            correction *= 0.015 / angle
+        offset = desired_pos - current[:3]
+        correction = (desired_rot * rotation.inv()).as_rotvec()
+        if np.linalg.norm(offset) > self.arm_init_max_step:
+            offset *= self.arm_init_max_step / np.linalg.norm(offset)
+        if np.linalg.norm(correction) > self.arm_init_max_rot:
+            correction *= self.arm_init_max_rot / np.linalg.norm(correction)
         quaternion = (Rotation.from_rotvec(correction) * rotation).as_quat()
         next_pose = np.concatenate([current[:3] + offset, quaternion])
         self.control_pubs["actions_arm"].publish(
             self.pose_message(next_pose, self.get_clock().now().to_msg())
         )
+        if self.returning and self.return_hand_cmd is not None:   # [PATCH] keep the hand open on the way back
+            self.publish_hand(self.return_hand_cmd)
 
     def pose_message(self, action, stamp):
         msg = PoseStamped()
@@ -374,6 +651,16 @@ class PolicyPlayerAgent(Node):
                 self.discard_actions(f"invalid {key} action")
                 return False
             if self._is_arm_key(key):
+                # [PATCH] temporal aggregation averages quaternions element-wise, which
+                # shrinks |q|; renormalize small deviations instead of discarding them.
+                if action.shape == (7,):
+                    norm = float(np.linalg.norm(action[3:]))
+                    self.max_quat_dev = max(self.max_quat_dev, abs(norm - 1.0))
+                    if self.renormalize_quat and 1e-9 < abs(norm - 1.0) <= self.quat_renorm_tol:
+                        action = action.copy()
+                        action[3:] = action[3:] / norm
+                        action_dict[key] = action
+                        self.n_quat_renorm += 1
                 if action.shape != (7,) or not np.isclose(np.linalg.norm(action[3:]), 1.0, atol=0.001):
                     self.discard_actions(f"invalid {key} pose")
                     return False
@@ -458,7 +745,16 @@ class PolicyPlayerAgent(Node):
 
         return {**images, **state_obs}, stamp_dict
 
-    def observation_problems(self, stamp_dict):
+    def observation_ages(self, stamp_dict):
+        """[PATCH] Age in seconds of every observation (None if missing)."""
+        now = self.get_clock().now()
+        return {
+            key: None if stamp is None else (now - rclpy.time.Time.from_msg(stamp)).nanoseconds / 1e9
+            for key, stamp in stamp_dict.items()
+        }
+
+    def observation_problems(self, stamp_dict, max_age=None):
+        max_age = self.max_observation_age if max_age is None else max_age
         now = self.get_clock().now()
         problems = []
         for key, stamp in stamp_dict.items():
@@ -466,14 +762,63 @@ class PolicyPlayerAgent(Node):
                 problems.append(f"{key} missing")
                 continue
             age = (now - rclpy.time.Time.from_msg(stamp)).nanoseconds / 1e9
-            if not 0.0 <= age <= self.max_observation_age:
+            if not 0.0 <= age <= max_age:
                 problems.append(f"{key} age {age:.3f} s")
         return problems
 
     def discard_actions(self, reason):
         self.policy.reset_policy()
         self.policy_stamp = None
+        self.n_discards += 1                # [PATCH] counted and written in the next logged step
+        self.last_discard_reason = reason
         self.get_logger().warn(f"Policy output paused: {reason}", throttle_duration_sec=2.0)
+
+    def apply_arm_lookahead(self, steps):
+        """[PATCH] Execute each predicted arm chunk from `steps` entries in (see module docstring)."""
+        if steps <= 0:
+            return
+        from srl_il.algo.base_algo import PolicyAggregatorSimple
+        horizon = int(self.policy.T_target)
+        if steps >= horizon:
+            raise ValueError(f"arm_lookahead_steps={steps} must be smaller than the chunk length {horizon}")
+        generate = self.policy.generate
+
+        def generate_shifted(*args, **kwargs):
+            out = generate(*args, **kwargs)
+            for key, value in out.items():
+                if self._is_arm_key(key):   # value: [B, T, D]; entries past the end are never executed
+                    out[key] = torch.cat([value[:, steps:], value[:, -1:].expand(-1, steps, -1)], dim=1)
+            return out
+
+        self.policy.generate = generate_shifted
+        self.policy._policy_aggregator = PolicyAggregatorSimple()
+        self.policy._policy_update_every = horizon - steps
+        self.get_logger().info(
+            f"[PATCH] arm_lookahead_steps={steps}: arm chunk shifted, plain chunk execution, "
+            f"re-predict every {horizon - steps} steps"
+        )
+
+    def check_arm_stall(self, action_dict, obs_dict):
+        """[PATCH] Warn when the commanded pose is far from the measured one and the arm does not move."""
+        if not self.arm_stall_warning or self.preview:
+            return
+        if "actions_arm" not in action_dict or obs_dict.get("qpos_arm") is None:
+            return
+        now = time.monotonic()
+        meas = np.asarray(obs_dict["qpos_arm"][:3], dtype=np.float64)
+        dist = float(np.linalg.norm(action_dict["actions_arm"][:3] - meas))
+        if dist <= 0.03:
+            self.stall_start = None
+            return
+        if self.stall_start is None or np.linalg.norm(meas - self.stall_start[1]) > 0.002:
+            self.stall_start = (now, meas)
+            return
+        if now - self.stall_start[0] > 2.0:
+            self.get_logger().error(
+                f"Arm is not following the policy: command {100 * dist:.1f} cm away and no motion for "
+                f"{now - self.stall_start[0]:.1f} s. Check the Franka controller (reflex? not active?).",
+                throttle_duration_sec=5.0,
+            )
 
     def run_policy_cb(self):
         """Compute an action only when every observation is fresh."""
@@ -483,7 +828,10 @@ class PolicyPlayerAgent(Node):
         if not self.running_policy:
             return
 
+        t_start = time.monotonic()  # [PATCH] timing
         obs_dict, stamp_dict = self.get_current_observations()
+        t_obs = time.monotonic()
+        obs_ages = self.observation_ages(stamp_dict) if self.log_timing else {}
         problems = self.observation_problems(stamp_dict)
         if obs_dict is None or problems:
             self.discard_actions(", ".join(problems) or "missing observation")
@@ -492,22 +840,77 @@ class PolicyPlayerAgent(Node):
         dbg_info = {} if self.logfile_root != "" else None
         # Convert to torch tensors, run policy
         with torch.inference_mode():
-            obs_torch = {k: torch.tensor(v).float().unsqueeze(0) for k, v in obs_dict.items()} # add batch dimension
+            obs_policy = obs_dict
+            if self.wrist_offset_rad != 0.0:    # [PATCH] wrist reading -> recording-time calibration
+                obs_policy = dict(obs_dict)
+                for k in obs_policy:
+                    if "hand" in k:
+                        obs_policy[k] = np.array(obs_policy[k], dtype=np.float64)
+                        obs_policy[k][0] -= self.wrist_offset_rad
+            obs_torch = {k: torch.tensor(v).float().unsqueeze(0) for k, v in obs_policy.items()} # add batch dimension
             actions = self.policy.predict_action(obs_torch, dbg_info)
             action_dict = {key: actions[key][0].cpu().numpy() for key in self.actions_cfg}
+            if self.wrist_offset_rad != 0.0:    # [PATCH] wrist command -> today's calibration
+                for k in action_dict:
+                    if not self._is_arm_key(k):
+                        action_dict[k] = action_dict[k].copy()
+                        action_dict[k][0] += self.wrist_offset_rad
+        t_fwd = time.monotonic()
 
-        problems = self.observation_problems(stamp_dict)
+        problems = self.observation_problems(stamp_dict, self.max_action_latency)
         if problems:
             self.discard_actions(", ".join(problems))
             return
 
+        # [PATCH] hand latch: filter short reopen blips of the policy
+        raw_actions = {k: v.copy() for k, v in action_dict.items()}
+        latched = False
+        if self.hand_latch is not None:
+            for key in action_dict:
+                if not self._is_arm_key(key):
+                    action_dict[key] = self.hand_latch(action_dict[key])
+            latched = self.hand_latch.latched
+
+        # [PATCH] lead gain: amplify how far each arm command lies beyond the measured position, so the
+        # compliant arm moves at demo speed (demo approach: 11.5 cm/s with ~6.4 cm lead; policy ~3.9 cm).
+        # Not cumulative: a command at the measured position stays there.
+        if self.arm_lead_gain != 1.0 and obs_dict.get("qpos_arm") is not None:
+            meas = np.asarray(obs_dict["qpos_arm"][:3], dtype=np.float64)
+            for key in action_dict:
+                if self._is_arm_key(key) and action_dict[key].shape == (7,):
+                    pose = action_dict[key].copy()
+                    lead = (pose[:3] - meas) * self.arm_lead_gain
+                    norm = np.linalg.norm(lead)
+                    if norm > self.arm_lead_max:
+                        lead *= self.arm_lead_max / norm
+                    pose[:3] = meas + lead
+                    action_dict[key] = pose
+
         # Warn about the gap between action publications.
+        publish_gap = None
         if self.policy_stamp is not None:
             time_diff = rclpy.time.Time.from_msg(self.get_clock().now().to_msg()) - rclpy.time.Time.from_msg(self.policy_stamp)
+            publish_gap = time_diff.nanoseconds / 1e9
             if time_diff.nanoseconds / 1e9 > self.max_observation_age:
                 self.get_logger().warn(f"Policy execution is too slow ({time_diff.nanoseconds / 1e9:.3f} s).")
         if not self.publish(action_dict):
             return
+        t_end = time.monotonic()
+
+        self.check_arm_stall(action_dict, obs_dict)  # [PATCH]
+        if self.auto_return and not self.returning:  # [PATCH]
+            self.track_attempt(action_dict, obs_dict)
+
+        # [PATCH] periodic latency summary in the terminal
+        if self.log_timing:
+            self.timing_hist.append((1000 * (t_obs - t_start), 1000 * (t_fwd - t_obs), 1000 * (t_end - t_start)))
+            th = np.array(self.timing_hist)
+            self.get_logger().info(
+                f"[timing] last {len(th)} steps: obs {th[:, 0].mean():.0f} ms, forward {th[:, 1].mean():.0f} ms "
+                f"(max {th[:, 1].max():.0f}), total {th[:, 2].mean():.0f} ms (max {th[:, 2].max():.0f}); "
+                f"max |q|-1 {self.max_quat_dev:.5f}",
+                throttle_duration_sec=5.0,
+            )
 
         # Log the actions if logging is enabled
         if self.log_file is not None:
@@ -515,6 +918,11 @@ class PolicyPlayerAgent(Node):
             action_group = self.log_file.create_group(f"step_{self.step_idx}/actions")
             for k, v in action_dict.items():
                 action_group.create_dataset(f"{k}", data=v)
+
+            # [PATCH] policy output before the hand latch / quaternion renormalization
+            raw_group = self.log_file.create_group(f"step_{self.step_idx}/actions_raw")
+            for k, v in raw_actions.items():
+                raw_group.create_dataset(f"{k}", data=v)
 
             # Log observations in obs_{k} format
             obs_group = self.log_file.create_group(f"step_{self.step_idx}/observations")
@@ -529,6 +937,27 @@ class PolicyPlayerAgent(Node):
                         if isinstance(v, torch.Tensor):
                             v = v.detach().cpu()
                         dbg_group.create_dataset(f"{k}", data=v)
+
+            # [PATCH] timing and health of this step
+            if self.log_timing:
+                tg = self.log_file.create_group(f"step_{self.step_idx}/timing")
+                tg.create_dataset("t_wall", data=time.time())
+                tg.create_dataset("obs_ms", data=1000 * (t_obs - t_start))
+                tg.create_dataset("forward_ms", data=1000 * (t_fwd - t_obs))
+                tg.create_dataset("total_ms", data=1000 * (t_end - t_start))
+                tg.create_dataset("publish_gap_s", data=np.nan if publish_gap is None else publish_gap)
+                tg.create_dataset("n_discards_before", data=self.n_discards)
+                tg.create_dataset("last_discard_reason", data=self.last_discard_reason)
+                tg.create_dataset("n_quat_renorm", data=self.n_quat_renorm)
+                tg.create_dataset("max_quat_dev", data=self.max_quat_dev)
+                tg.create_dataset("hand_latched", data=int(latched))
+                tg.create_dataset("attempt_idx", data=self.attempt_idx)
+                for k, age in obs_ages.items():
+                    tg.create_dataset(f"age_{k}_s", data=np.nan if age is None else age)
+            self.n_discards = 0
+            self.last_discard_reason = ""
+            self.n_quat_renorm = 0
+            self.max_quat_dev = 0.0
             self.log_file.flush()
             self.step_idx += 1
 

@@ -16,3 +16,38 @@ actions:
     topic: /right/arm/end_effector_pose_cmd
   actions_hand:
     topic: /right/hand/policy_output
+
+# Runtime patches for running cube40_v4_diff_77 / checkpoint_150 on the hardware as of 27 Nov 2026
+# (hand recalibrated after the demos; Franka Desk end effector: identity rotation, 0.1034 m along z).
+# See experiments/docs/cube_sorting_inference_notes.md for the setup, launch commands and results.
+runtime_patches:
+  renormalize_quat: true
+  quat_renorm_tol: 0.05
+  log_timing: true
+  arm_stall_warning: true
+  max_action_latency_s: 0.35  # obs age allowed at publish time (the forward pass is ~100-180 ms)
+  hand_latch:                 # hold a grasp through short "open" blips of the policy
+    enabled: true
+    joints: [6, 9, 12, 15]
+    close_deg: 50.0
+    open_deg: 30.0
+    release_steps: 10
+    max_hold_steps: 50        # release after 5 s at the latest (demos held ~2 s)
+  wrist_offset_deg: -30.0     # the wrist was uncalibrated in the demos; -30 worked best (0, -35, -50, -70 tried)
+  arm_lookahead_steps: 4      # the arm lags ~5 steps; execute arm chunks 4 steps in
+  arm_lead_gain: 2.0          # arm moves at ~half demo speed otherwise; 2.0 verified (17:20 run). 2.5 looked good too
+  arm_lead_max_m: 0.15
+  # init_arm / auto return (launch with allow_arm_init:=true and the start pose, see the notes)
+  arm_init_max_step_m: 0.03
+  arm_init_max_step_deg: 20.0 # yaw about the tool axis has a dead zone; smaller leads stall
+  arm_init_tolerance_m: 0.015
+  arm_init_tolerance_deg: 5.0
+  arm_init_integral_gain: 0.1
+  arm_init_stalled_wait_s: 4.0
+  arm_init_stalled_ok_deg: 10.0
+  auto_return:                # after every attempt go back to the start pose and continue
+    enabled: true
+    no_grasp_timeout_s: 15.0
+    lift_m: 0.05
+    closed_deg: 50.0
+    after_release_s: 1.0
