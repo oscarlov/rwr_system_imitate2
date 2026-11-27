@@ -8,7 +8,11 @@ was placed:
     This estimate has a bias of a few cm of its own, so compare settings with each
     other rather than reading the numbers as absolute.
   - pushed: how far (pixels in the 224x224 side image) the cube moved before that closing.
-  - lifted: whether the arm rose > 5 cm while the hand stayed closed.
+  - lifted: whether the arm rose > 5 cm while the hand stayed closed (also true for an EMPTY lift).
+  - cube along: success check. The cube's red area in the wrist camera at the top of the lift divided by
+    the area when the hand closed. In the demos (cube certainly lifted) it grows: median 3.7x, >= 1.9x
+    in 90%. An empty lift leaves the cube behind (ratio < 1). Counted as success when >= 1.5.
+    The side-camera "cube left its spot" check overcounts: the hand hides the cube.
   - closure: measured finger closure while closed (demos holding the cube: ~71 deg); >= 78 = closed on air.
 
     pixi run python summarize_trials.py --since 15:45            # all trials after 15:45 today
@@ -41,6 +45,24 @@ def find_cube(rgb):
             if best is None or a > best[1]:
                 best = (cen[i], a)
     return None if best is None else tuple(best[0])
+
+
+def red_area(rgb):
+    """Largest compact red blob in a wrist image, as a share of the image."""
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    m = cv2.inRange(hsv, (0, 120, 70), (8, 255, 255)) | cv2.inRange(hsv, (172, 120, 70), (180, 255, 255))
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8))
+    n, _, st, _ = cv2.connectedComponentsWithStats(m)
+    best = 0
+    for i in range(1, n):
+        x, y, w, h, a = st[i]
+        if a / (w * h) >= 0.5:
+            best = max(best, a)
+    return best / (rgb.shape[0] * rgb.shape[1])
+
+
+def wrist_image(f, i):
+    return (f[f"step_{i}/observations/wrist_view_images"][()].transpose(1, 2, 0) * 255).astype(np.uint8)
 
 
 def feat(x):
@@ -110,6 +132,9 @@ def summarize_segment(f, a, b, arm, hand, meas, model, label):
     row["error_cm"] = (arm[s] - (feat(cube if cube else start_cube) @ model)[0]) * 100
     row["pushed_px"] = np.hypot(*(np.subtract(cube, start_cube))) if cube else np.nan
     row["lifted"] = (arm[s:e + 1, 2].max() - arm[s, 2]) > 0.05
+    top = s + int(np.argmax(arm[s:e + 1, 2]))
+    a0 = red_area(wrist_image(f, a + s))
+    row["along"] = bool(row["lifted"] and a0 > 0.01 and red_area(wrist_image(f, a + top)) / a0 >= 1.5)
     # measured finger closure while closed: demos holding the cube ~71 deg (p90 75); >= 78 = closed on air
     row["closure"] = float(np.median(meas[s:e + 1]))
     any_lift = 0
@@ -135,7 +160,7 @@ def main():
         raise SystemExit("no logs given")
     model = demo_grasp_model()
     rows = [r for q in sorted(paths, key=os.path.getmtime) for r in summarize(q, model)]
-    print(f"{'trial (log #attempt)':26s} {'steps':>5s} {'closes':>6s}  first-close error dx/dy/dz (cm)   |err|  pushed(px) lifted  lifts  closure")
+    print(f"{'trial (log #attempt)':26s} {'steps':>5s} {'closes':>6s}  first-close error dx/dy/dz (cm)   |err|  pushed(px) lifted  lifts  closure  cube along")
     errs = []
     for r in rows:
         if "error_cm" not in r:
@@ -143,7 +168,9 @@ def main():
             continue
         d = r["error_cm"]; errs.append(d)
         print(f"{r['log']:26s} {r['steps']:5d} {r['closes']:6d}  {d[0]:+6.1f} {d[1]:+6.1f} {d[2]:+6.1f}            "
-              f"{np.linalg.norm(d):5.1f}  {r['pushed_px']:8.1f}   {'yes' if r['lifted'] else 'no ':3s}   {r['lifts_total']}   {r['closure']:4.0f}{' (air)' if r['closure'] >= 78 else ''}")
+              f"{np.linalg.norm(d):5.1f}  {r['pushed_px']:8.1f}   {'yes' if r['lifted'] else 'no ':3s}   {r['lifts_total']}   {r['closure']:4.0f}{' (air)' if r['closure'] >= 78 else '      '}   {'YES' if r['along'] else 'no'}")
+    n_ok = sum(1 for r in rows if r.get("along"))
+    print(f"\nsuccesses (cube came along in the wrist camera): {n_ok} of {len(rows)} attempts")
     if errs:
         e = np.array(errs)
         print(f"\n{len(e)} trials: median first-close error dx {np.median(e[:, 0]):+.1f} dy {np.median(e[:, 1]):+.1f} "
