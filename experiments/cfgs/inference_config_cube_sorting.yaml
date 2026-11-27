@@ -35,7 +35,7 @@ runtime_patches:
     max_hold_steps: 50        # release after 5 s at the latest (demos held ~2 s)
   wrist_offset_deg: -30.0     # the wrist was uncalibrated in the demos; -30 worked best (0, -35, -50, -70 tried)
   arm_lookahead_steps: 4      # the arm lags ~5 steps; execute arm chunks 4 steps in
-  arm_lead_gain: 2.0          # arm moves at ~half demo speed otherwise; 2.0 verified (17:20 run). 2.5 looked good too
+  arm_lead_gain: 2.5         # arm moves at ~half demo speed otherwise; 2.0 verified (17:20 run). 2.5 looked good too
   arm_lead_max_m: 0.15
   # init_arm / auto return (launch with allow_arm_init:=true and the start pose, see the notes)
   arm_init_max_step_m: 0.03
